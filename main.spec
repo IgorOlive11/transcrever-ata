@@ -5,7 +5,7 @@ a = Analysis(
     ['src\\main.py'],
     pathex=[],
     binaries=[],
-    datas=[('src/ui', 'ui'), ('.env', '.')],
+    datas=[('src/ui', 'ui'), ('src/ui/windowicon.ico', 'ui'), ('.env', '.')],
     hiddenimports=['tiktoken_ext.openai_public'],
     hookspath=[],
     hooksconfig={},

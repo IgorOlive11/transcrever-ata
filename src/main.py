@@ -1,13 +1,9 @@
 import sys
 import os
+import ctypes
 
 def resource_path(relative_path):
-    """
-    Retorna o caminho absoluto para recursos, funcionando
-    tanto no modo desenvolvimento quanto no executável PyInstaller.
-    """
     if getattr(sys, 'frozen', False):
-        # Executável PyInstaller
         return os.path.join(sys._MEIPASS, relative_path)
     return os.path.join(os.path.dirname(__file__), relative_path)
 
@@ -15,7 +11,9 @@ if getattr(sys, 'frozen', False):
     cache_path = resource_path("tiktoken_cache")
     os.environ["TIKTOKEN_CACHE_DIR"] = cache_path
 
-env_path = resource_path(".env")
+# .env fora da pasta src
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+env_path = os.path.join(project_root, ".env")
 
 if os.path.exists(env_path):
     from dotenv import load_dotenv
@@ -24,15 +22,14 @@ else:
     print(f"Aviso: arquivo .env não encontrado em {env_path}")
 
 import traceback
-from PySide6.QtWidgets import (
-    QApplication, QMainWindow, QFileDialog, QMessageBox, QProgressDialog
-)
+from PySide6.QtWidgets import QApplication, QMainWindow, QFileDialog, QMessageBox, QProgressDialog
 from PySide6.QtCore import QThread, QObject, Signal, QRunnable, QThreadPool
-from PySide6.QtGui import QIcon
+from PySide6.QtGui import QIcon, QTextCursor
 from transcrever import transcrever_audio
 from gerar_ata import gerar_ata_formal
 from interface import Ui_MainWindow
-
+from transcrever import AssemblyAIStreamWorker, API_KEY
+from dialog_info_assembleia import DialogInfoAssembleia  # Nova importação
 
 class AtaWorkerSignals(QObject):
     finished = Signal()
@@ -41,10 +38,11 @@ class AtaWorkerSignals(QObject):
 
 
 class AtaWorker(QRunnable):
-    def __init__(self, texto_transcricao, caminho_saida):
+    def __init__(self, texto_transcricao, caminho_saida, info_assembleia=None):
         super().__init__()
         self.texto_transcricao = texto_transcricao
         self.caminho_saida = caminho_saida
+        self.info_assembleia = info_assembleia
         self.signals = AtaWorkerSignals()
 
     def run(self):
@@ -53,7 +51,8 @@ class AtaWorker(QRunnable):
             gerar_ata_formal(
                 self.texto_transcricao,
                 caminho_saida=self.caminho_saida,
-                status_callback=self.signals.progress.emit
+                status_callback=self.signals.progress.emit,
+                info_assembleia=self.info_assembleia  # Passa as informações
             )
             self.signals.progress.emit("ATA gerada com sucesso.")
             self.signals.finished.emit()
@@ -98,7 +97,7 @@ class MainWindow(QMainWindow):
         self.ui.btnTranscrever.clicked.connect(self.transcrever)
         self.ui.btnGerar.clicked.connect(self.gerar_ata)
 
-        self.thread = None
+        self.worker = None
         self.progress_dialog = None
 
     def selecionar_arquivo(self):
@@ -121,16 +120,67 @@ class MainWindow(QMainWindow):
             return
 
         self.ui.textEdit.clear()
-        self.ui.textEdit.setPlainText("Transcrevendo, aguarde...")
-        self.ui.statusbar.showMessage("")
+        self.ui.statusbar.showMessage("Iniciando transcrição...")
 
         self.ui.btnTranscrever.setEnabled(False)
 
-        self.thread = WorkerThread(caminho)
-        self.thread.finished.connect(self.transcricao_finalizada)
-        self.thread.error.connect(self.transcricao_erro)
-        self.thread.status.connect(self.atualizar_status)
-        self.thread.start()
+        # OPÇÃO 1: Efeito character-by-character (mais dramático)
+        self.worker = AssemblyAIStreamWorker(API_KEY, caminho)
+        self.worker.partial_transcript.connect(self.update_status_text)
+        self.worker.typing_effect.connect(self.append_character)
+        self.worker.error.connect(self.transcricao_erro)
+        self.worker.finished.connect(self.transcricao_finalizada)
+
+        # OPÇÃO 2: Efeito word-by-word (mais realista)
+        # Descomente as linhas abaixo e comente as de cima para usar
+        # from transcrever import AssemblyAIRealisticStreamWorker
+        # self.worker = AssemblyAIRealisticStreamWorker(API_KEY, caminho)
+        # self.worker.partial_transcript.connect(self.update_status_text)
+        # self.worker.word_chunk.connect(self.replace_text)
+        # self.worker.error.connect(self.transcricao_erro)
+        # self.worker.finished.connect(self.transcricao_finalizada)
+
+        self.worker.start()
+
+    def update_status_text(self, texto):
+        """Atualiza apenas mensagens de status, não o texto principal"""
+        if texto == "clear_status":
+            # Limpa o campo de texto para começar o typing
+            self.ui.textEdit.clear()
+            return
+            
+        if any(emoji in texto for emoji in ['🔄', '📤', '🚀', '⏳']):
+            self.ui.statusbar.showMessage(texto.replace('\n', ' ').strip())
+
+    def append_character(self, text):
+        """Adiciona texto (pode ser um caractere ou palavra/frase)"""
+        cursor = self.ui.textEdit.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        
+        # Se receber o texto completo (OPÇÃO 3), substitui tudo
+        if len(text) > 100:  # Provavelmente texto completo
+            self.ui.textEdit.setPlainText(text)
+        else:
+            # Adiciona caractere por caractere ou palavra por palavra
+            cursor.insertText(text)
+            
+        self.ui.textEdit.setTextCursor(cursor)
+        
+        # Auto-scroll para o final
+        scrollbar = self.ui.textEdit.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
+        
+        QApplication.processEvents()
+
+    def replace_text(self, texto_completo):
+        """Substitui todo o texto (para efeito word-by-word)"""
+        self.ui.textEdit.setPlainText(texto_completo)
+        
+        # Auto-scroll para o final
+        scrollbar = self.ui.textEdit.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
+        
+        QApplication.processEvents()
 
     def atualizar_status(self, mensagem):
         self.ui.statusbar.showMessage(mensagem)
@@ -138,16 +188,15 @@ class MainWindow(QMainWindow):
             self.progress_dialog.setLabelText(mensagem)
         QApplication.processEvents()
 
-    def transcricao_finalizada(self, texto):
+    def transcricao_finalizada(self, _=None):
         self.ui.btnTranscrever.setEnabled(True)
-        self.ui.textEdit.setPlainText(texto)
-        self.thread = None
-        self.ui.statusbar.showMessage("Transcrição concluída.")
+        self.ui.statusbar.showMessage("Transcrição concluída!")
+        self.worker = None
 
     def transcricao_erro(self, msg):
         self.ui.btnTranscrever.setEnabled(True)
         QMessageBox.critical(self, "Erro na transcrição", msg)
-        self.thread = None
+        self.worker = None
         self.ui.statusbar.showMessage("Erro na transcrição.")
 
     def gerar_ata(self):
@@ -156,10 +205,26 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Aviso", "Nenhuma transcrição disponível para gerar ATA.")
             return
 
+        # Abre diálogo para coletar informações da assembleia (passando a transcrição)
+        info_assembleia = DialogInfoAssembleia.obterInformacoesAssembleia(self, texto_transcricao)
+        if not info_assembleia:
+            return  # Usuario cancelou
+
+        # Validação básica (apartamento não é mais obrigatório)
+        campos_obrigatorios = ['nome_condominio', 'presidente_nome', 'secretario_nome']
+        for campo in campos_obrigatorios:
+            if not info_assembleia[campo]:
+                QMessageBox.warning(
+                    self, 
+                    "Campos Obrigatórios", 
+                    f"Por favor, preencha o campo: {campo.replace('_', ' ').title()}"
+                )
+                return
+
         caminho, _ = QFileDialog.getSaveFileName(
             self,
             "Salvar Ata como...",
-            "ata_gerada.docx",
+            f"ata_{info_assembleia['nome_condominio'].lower().replace(' ', '_')}_{info_assembleia['data_assembleia'].replace('/', '_')}.docx",
             "Documentos Word (*.docx)"
         )
         if not caminho:
@@ -171,7 +236,7 @@ class MainWindow(QMainWindow):
         self.progress_dialog.setModal(True)
         self.progress_dialog.show()
 
-        self.worker = AtaWorker(texto_transcricao, caminho)
+        self.worker = AtaWorker(texto_transcricao, caminho, info_assembleia)
         self.worker.signals.progress.connect(self.atualizar_status)
         self.worker.signals.finished.connect(self.finalizar_progresso)
         self.worker.signals.error.connect(self.erro_progresso)
@@ -190,11 +255,21 @@ class MainWindow(QMainWindow):
             self.progress_dialog = None
         QMessageBox.critical(self, "Erro", f"Ocorreu um erro:\n{msg}")
 
+    def closeEvent(self, event):
+        """Limpa threads ao fechar"""
+        if self.worker and self.worker.isRunning():
+            self.worker.terminate()
+            self.worker.wait(1000)
+        event.accept()
+
 
 if __name__ == "__main__":
+    ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("com.meuapp.transcreverata")
+
     app = QApplication(sys.argv)
+
     icon_path = resource_path(os.path.join("ui", "windowicon.ico"))
-    app.setWindowIcon(QIcon(icon_path))  # Ícone global do app
+    app.setWindowIcon(QIcon(icon_path))
 
     style_path = resource_path(os.path.join("ui", "style.qss"))
     if os.path.exists(style_path):
@@ -205,7 +280,5 @@ if __name__ == "__main__":
         print(f"Aviso: arquivo de estilo não encontrado em {style_path}")
 
     window = MainWindow()
-    window.setWindowIcon(QIcon(icon_path))  # Ícone da janela
     window.show()
     sys.exit(app.exec())
-
