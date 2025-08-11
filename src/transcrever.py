@@ -8,28 +8,32 @@ from PySide6.QtWidgets import QApplication
 load_dotenv()
 API_KEY = os.getenv("ASSEMBLYAI_API_KEY")
 
-class AssemblyAIStreamWorker(QThread):
-    """Worker que simula streaming com efeito de typing em tempo real"""
-    partial_transcript = Signal(str)
+class TranscriptionWorker(QThread):
+    """Worker corrigido que não trava durante o typing effect"""
+    progress = Signal(str)
+    text_update = Signal(str)
     finished = Signal()
     error = Signal(str)
-    typing_effect = Signal(str)  # Sinal para efeito de typing
 
-    def __init__(self, api_token, audio_path):
+    def __init__(self, audio_path):
         super().__init__()
-        self.api_token = api_token
         self.audio_path = audio_path
+        self.api_token = API_KEY
+        self.current_text = ""
+        self.full_text = ""
+        self.typing_timer = None
 
     def run(self):
         try:
             # Mostra status inicial
-            self.partial_transcript.emit("🔄 Iniciando transcrição...")
+            self.progress.emit("🔄 Iniciando transcrição...")
             
             # Usa a API REST
             texto = self.transcrever_com_updates()
             
-            # Inicia o efeito de typing usando sleep ao invés de QTimer
-            self.start_typing_effect(texto)
+            # Inicia o efeito de typing de forma segura
+            self.full_text = texto
+            self.start_typing_effect_safe()
             
         except Exception as e:
             self.error.emit(str(e))
@@ -37,15 +41,15 @@ class AssemblyAIStreamWorker(QThread):
     def transcrever_com_updates(self):
         """Transcreve usando API REST"""
         # Upload do arquivo
-        self.partial_transcript.emit("📤 Fazendo upload do arquivo...")
+        self.progress.emit("📤 Fazendo upload do arquivo...")
         upload_url = upload_file(self.audio_path, self.api_token)
         
         # Solicita transcrição
-        self.partial_transcript.emit("🚀 Upload concluído. Iniciando transcrição...")
+        self.progress.emit("🚀 Upload concluído. Iniciando transcrição...")
         transcript_id = request_transcription(upload_url, self.api_token)
         
         # Polling
-        self.partial_transcript.emit("⏳ Processando áudio...")
+        self.progress.emit("⏳ Processando áudio...")
         return self.poll_transcription(transcript_id)
 
     def poll_transcription(self, transcript_id):
@@ -73,115 +77,41 @@ class AssemblyAIStreamWorker(QThread):
 
             time.sleep(3)
 
-    def start_typing_effect(self, text):
-        """Simula typing usando sleep ao invés de QTimer"""
-        # Limpa mensagens de status
-        self.partial_transcript.emit("clear_status")
+    def start_typing_effect_safe(self):
+        """Efeito de typing usando QTimer (não bloqueia a thread)"""
+        if not self.full_text:
+            self.finished.emit()
+            return
+            
+        # Limpa status e prepara para typing
+        self.progress.emit("")
+        self.current_text = ""
         
-        # Efeito de typing MUITO mais rápido - várias opções:
+        # OPÇÃO SIMPLES: Mostra texto por palavras usando QTimer
+        words = self.full_text.split()
+        self.word_index = 0
+        self.words_list = words
         
-        # OPÇÃO 1: Super rápido (5ms por caractere)
-        for char in text:
-            self.typing_effect.emit(char)
-            time.sleep(0.005)  # 5ms entre cada caractere
-            
-        # OPÇÃO 2: Descomente para usar chunks de palavras (mais rápido ainda)
-        # words = text.split()
-        # current_text = ""
-        # for word in words:
-        #     current_text += word + " "
-        #     self.typing_effect.emit(current_text)
-        #     time.sleep(0.05)  # 50ms por palavra
-            
-        # OPÇÃO 3: Descomente para exibir instantaneamente
-        # self.typing_effect.emit(text)
-            
-        self.finished.emit()
+        # Cria timer para efeito de typing
+        self.typing_timer = QTimer()
+        self.typing_timer.timeout.connect(self.add_next_word)
+        self.typing_timer.start(50)  # 50ms entre palavras
+    
+    def add_next_word(self):
+        """Adiciona próxima palavra (chamado pelo QTimer)"""
+        if self.word_index < len(self.words_list):
+            self.current_text += self.words_list[self.word_index] + " "
+            self.text_update.emit(self.current_text.strip())
+            self.word_index += 1
+        else:
+            # Terminou o typing
+            if self.typing_timer:
+                self.typing_timer.stop()
+                self.typing_timer = None
+            self.finished.emit()
 
 
-# Classe alternativa com chunks de palavras (mais realista)
-class AssemblyAIRealisticStreamWorker(QThread):
-    """Worker que simula streaming palavra por palavra (mais realista)"""
-    partial_transcript = Signal(str)
-    finished = Signal()
-    error = Signal(str)
-    word_chunk = Signal(str)
-
-    def __init__(self, api_token, audio_path):
-        super().__init__()
-        self.api_token = api_token
-        self.audio_path = audio_path
-
-    def run(self):
-        try:
-            # Status inicial
-            self.partial_transcript.emit("🔄 Iniciando transcrição...\n\n")
-            
-            # Transcrição
-            texto = self.transcrever_com_updates()
-            
-            # Simula streaming palavra por palavra
-            self.simulate_word_streaming(texto)
-            
-        except Exception as e:
-            self.error.emit(str(e))
-
-    def transcrever_com_updates(self):
-        """Mesma lógica de transcrição"""
-        upload_url = upload_file(self.audio_path, self.api_token)
-        transcript_id = request_transcription(upload_url, self.api_token)
-        return self.poll_transcription(transcript_id)
-
-    def poll_transcription(self, transcript_id):
-        """Polling da transcrição"""
-        endpoint = f"https://api.assemblyai.com/v2/transcript/{transcript_id}"
-        headers = {"authorization": self.api_token}
-        
-        start_time = time.time()
-        
-        while True:
-            response = requests.get(endpoint, headers=headers)
-            response.raise_for_status()
-            data = response.json()
-
-            status = data["status"]
-            
-            if status == "completed":
-                return data["text"]
-            elif status == "error":
-                raise Exception(f"Erro na transcrição: {data.get('error')}")
-            
-            if time.time() - start_time > 600:
-                raise TimeoutError("Timeout na transcrição")
-
-            time.sleep(3)
-
-    def simulate_word_streaming(self, text):
-        """Simula streaming enviando palavras gradualmente"""
-        # Limpa status
-        self.partial_transcript.emit("")
-        
-        words = text.split()
-        current_text = ""
-        
-        for i, word in enumerate(words):
-            current_text += word + " "
-            
-            # Emite o texto completo até agora
-            self.word_chunk.emit(current_text)
-            
-            # Pausa variável baseada no comprimento da palavra
-            pause = min(0.1 + len(word) * 0.02, 0.3)  # Entre 100ms e 300ms
-            time.sleep(pause)
-            
-            # Pausa extra após pontuação
-            if word.endswith(('.', '!', '?', ':')):
-                time.sleep(0.5)
-        
-        self.finished.emit()
-
-
-# Função original que o main.py ainda precisa
+# Função original para compatibilidade
 def transcrever_audio(caminho_arquivo, status_callback=None):
     """Função principal de transcrição (fallback)"""
     if not API_KEY:
@@ -277,3 +207,64 @@ def request_transcription(audio_url, api_key):
         raise Exception(f"Erro na requisição: {response.status_code} - {response.text}")
     
     return response.json()["id"]
+
+
+# Classe legada mantida para compatibilidade (mas corrigida)
+class AssemblyAIStreamWorker(QThread):
+    """Versão corrigida da classe original"""
+    partial_transcript = Signal(str)
+    finished = Signal()
+    error = Signal(str)
+    typing_effect = Signal(str)
+
+    def __init__(self, api_token, audio_path):
+        super().__init__()
+        self.api_token = api_token
+        self.audio_path = audio_path
+
+    def run(self):
+        try:
+            self.partial_transcript.emit("🔄 Iniciando transcrição...")
+            texto = self.transcrever_com_updates()
+            
+            # Emite texto completo diretamente (sem efeito problemático)
+            self.typing_effect.emit(texto)
+            self.finished.emit()
+            
+        except Exception as e:
+            self.error.emit(str(e))
+
+    def transcrever_com_updates(self):
+        """Transcreve usando API REST"""
+        self.partial_transcript.emit("📤 Fazendo upload do arquivo...")
+        upload_url = upload_file(self.audio_path, self.api_token)
+        
+        self.partial_transcript.emit("🚀 Upload concluído. Iniciando transcrição...")
+        transcript_id = request_transcription(upload_url, self.api_token)
+        
+        self.partial_transcript.emit("⏳ Processando áudio...")
+        return self.poll_transcription(transcript_id)
+
+    def poll_transcription(self, transcript_id):
+        """Polling da transcrição"""
+        endpoint = f"https://api.assemblyai.com/v2/transcript/{transcript_id}"
+        headers = {"authorization": self.api_token}
+        
+        start_time = time.time()
+        
+        while True:
+            response = requests.get(endpoint, headers=headers)
+            response.raise_for_status()
+            data = response.json()
+
+            status = data["status"]
+            
+            if status == "completed":
+                return data["text"]
+            elif status == "error":
+                raise Exception(f"Erro na transcrição: {data.get('error', 'Erro desconhecido')}")
+            
+            if time.time() - start_time > 600:
+                raise TimeoutError("Timeout: transcrição demorou mais de 10 minutos")
+
+            time.sleep(3)
